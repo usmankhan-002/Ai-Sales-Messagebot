@@ -45,6 +45,7 @@
           <div class="account-head"><span class="avatar avatar-lg">You</span><div><strong>Your account</strong><span>Advisor workspace</span></div></div>
           <button type="button" role="menuitem" data-account="setup" data-testid="account-ai-setup"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span><strong>AI setup</strong><small>Writing style, tone and guidance</small></span></button>
           <button type="button" role="menuitem" data-account="ranking" data-testid="account-ranking-setup"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span><strong>Organization ranking</strong><small>Configure sales message indicators</small></span></button>
+          <button type="button" role="menuitem" data-account="market-commentary" data-testid="account-market-commentary"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span><strong>Organization market commentary</strong><small>Set today’s market context</small></span></button>
           <button type="button" role="menuitem" data-account="shortcuts" data-testid="account-shortcuts"><svg class="icon" aria-hidden="true"><use href="#i-bookmark"/></svg><span><strong>Saved key points</strong><small>Reusable shortcuts for drafting</small></span></button>
           <button type="button" role="menuitem" data-account="clients" data-testid="account-clients"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span><strong>Client profiles</strong><small>Context the AI uses per client</small></span></button>
         </div>
@@ -162,6 +163,8 @@
 
       <div class="ai-block">
         <div class="toggle-row">
+          <label class="switch"><input type="checkbox" id="toggleMarketCommentary" data-testid="ai-market-commentary-toggle"><span class="track" aria-hidden="true"></span>Use today’s organization market commentary</label>
+          <p class="hint commentary-status" id="marketCommentaryStatus" role="status" data-testid="market-commentary-status"></p>
           <label class="switch"><input type="checkbox" id="toggleSubject" data-testid="ai-suggest-subject-toggle"><span class="track" aria-hidden="true"></span>Suggest a subject line</label>
           <label class="switch"><input type="checkbox" id="toggleAlt" data-testid="ai-show-alternative-toggle"><span class="track" aria-hidden="true"></span>Show an alternative</label>
         </div>
@@ -194,7 +197,7 @@
         <div class="why"><span>Your guidance</span><p id="guidanceMarketWhy"></p></div>
         <div class="why"><span>Client</span><p id="guidanceClientWhy"></p></div>
         <div class="why"><span>Product</span><p id="guidanceProductWhy"></p></div>
-        <p class="hint">Only the deal, client profile and product copy are used. No external market data, and every figure is kept exactly as entered.</p>
+        <p class="hint">Only the deal, client profile and product copy are used, plus today’s organization commentary when enabled. No external market data, and every figure is kept exactly as entered.</p>
       </details>
     </aside>
   </main>
@@ -307,6 +310,20 @@
         <ul class="manage-list" id="manageShortcuts" data-testid="setup-shortcut-list"></ul>
       </div>
       <div class="drawer-foot"><button class="btn" type="button" id="resetSetup" data-testid="ai-setup-reset-button">Reset to defaults</button><button class="btn btn-primary" type="button" id="saveSetup" data-testid="ai-setup-save-button">Save setup</button></div>
+    </section>
+  </div>
+
+  <div class="drawer" id="marketCommentaryDrawer" aria-hidden="true" data-testid="organization-market-commentary-settings">
+    <div class="drawer-scrim" data-close="marketCommentary"></div>
+    <section class="drawer-panel drawer-narrow" role="dialog" aria-modal="true" aria-labelledby="marketCommentaryTitle">
+      <div class="drawer-head"><div><span class="eyebrow">Organization defaults</span><h2 id="marketCommentaryTitle">Daily market commentary</h2><p>Save the organization’s commentary for one date. Only today’s UTC-dated note can be included in drafts.</p></div><button class="icon-btn" type="button" data-close="marketCommentary" aria-label="Close"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+      <div class="drawer-body">
+        <div class="field"><label for="orgName">Organization name</label><input id="orgName" maxlength="120" data-testid="market-commentary-organization-name"></div>
+        <div class="field"><label for="marketCommentaryEmail">Commentary email address</label><div class="email-preview"><input id="marketCommentaryEmail" class="mono" type="text" readonly aria-describedby="marketCommentaryEmailHint" data-testid="market-commentary-email-address"><button type="button" class="btn btn-sm" id="copyMarketCommentaryEmail">Copy</button></div><p class="hint" id="marketCommentaryEmailHint">Prototype address only: inbound email delivery is not connected in this demo.</p></div>
+        <div class="field"><label for="marketCommentaryDate">Commentary date (UTC)</label><input id="marketCommentaryDate" type="date" data-testid="market-commentary-date"></div>
+        <div class="field"><label for="marketCommentaryText">Today’s market commentary</label><textarea id="marketCommentaryText" rows="9" maxlength="8000" placeholder="Paste the organization’s approved market commentary for this date." data-testid="market-commentary-text"></textarea><p class="hint">Use only approved, dated market facts. The AI will not treat this text as instructions or extend its claims.</p></div>
+      </div>
+      <div class="drawer-foot"><span class="hint" id="marketCommentarySavedStatus" aria-live="polite"></span><button class="btn btn-primary" type="button" id="saveMarketCommentary" data-testid="save-market-commentary">Save commentary</button></div>
     </section>
   </div>
 

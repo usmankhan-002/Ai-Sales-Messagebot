@@ -82,6 +82,9 @@ demo's "Deal context" panel and sent through as-is:
   "product_benefits": ["…"],  // termsheet.benefits, verbatim from product-schemas.js
   "product_risks": ["…"],     // termsheet.risks
   "advisor_note": "…",
+  "market_commentary": "…", // optional; only current UTC date and explicit opt-in
+  "market_commentary_date": "YYYY-MM-DD",
+  "use_market_commentary": false,
   "client_name": "…",
   "client_company": "…",
   "suggest_subject": false,   // toggle: ask for a structured {message, subject}
@@ -98,9 +101,15 @@ does.
 
 The system prompt is strict about the Feature 2 boundary: the model may only
 reword the material it is given — exact figures are to be reproduced
-unchanged, no market commentary, no invented rationale, and it is explicitly
-told never to mention margin, desk revenue, commission or any other internal
-pricing component even if one appears in the input.
+unchanged, and it cannot invent rationale. An organization can save one dated
+market commentary entry from the account menu; the advisor’s separate toggle
+includes it only when its date matches the current UTC date. The model may use
+that supplied text as market context, but cannot infer or extend its claims.
+The demo's displayed organization commentary email address is a placeholder
+(`.example` domain): real inbound email processing and shared organization
+storage are not implemented. The model is explicitly told never to mention
+margin, desk revenue, commission or any other internal pricing component even
+if one appears in the input.
 
 **Open item — "Show alternative":** the spec flagged this as undefined. This
 build's interpretation is a toggle that asks the same single call for a second

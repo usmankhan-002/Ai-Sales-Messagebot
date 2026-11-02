@@ -1,9 +1,9 @@
 # AI Sales Message API
 
 Turns an advisor's short key points into a polished, client-ready intro message,
-grounded only in the deal terms, product copy and client profile you send.
-It never adds market commentary or invents figures, and it keeps every rate and
-amount exactly as supplied.
+grounded only in the deal terms, product copy, client profile and any explicitly
+enabled, current-day organization market commentary you send. It never invents
+market facts or figures, and it keeps every rate and amount exactly as supplied.
 
 - **Base URL:** `https://<your-service>.onrender.com` (ask the service owner)
 - **Auth:** an API key on every request
@@ -53,6 +53,9 @@ API from your backend**, not from browser code where users could read the key.
 | `tone` | string | no | `"Formal"`, `"Consultative"`, `"Direct"`, `"Warm"` |
 | `sales_positioning` | string | no | Where to put the emphasis (never adds facts) |
 | `advisor_guidance` | string | no | Free-form standing guidance (max 12,000 characters). May include a sample output for tone/structure; its facts are not reused unless independently supported by the current deal, profile or advisor note. |
+| `market_commentary` | string | no | Organization-approved daily market commentary (max 8,000 characters); included only when `use_market_commentary` is true and its date is today in UTC. Treated as source facts, not instructions. |
+| `market_commentary_date` | date | no | ISO date (`YYYY-MM-DD`) the commentary applies to. Stale and future commentary is excluded. |
+| `use_market_commentary` | bool | no | Defaults to `false`; explicitly enables current-day market commentary in this draft. |
 | `master_mkt_why` / `master_client_why` / `master_product_why` | string | no | Legacy fields retained for existing integrations; new clients should use `advisor_guidance`. |
 | `suggest_subject` | bool | no | `true` also returns an email `subject` |
 | `show_alternative` | bool | no | `true` also returns an `alternative_message` (same facts, different angle) |
@@ -118,6 +121,13 @@ curl -X POST "$BASE_URL/v1/ai/sales-message" \
     "suggest_subject": true
   }'
 ```
+
+The built-in demo lets an organization save one dated commentary entry from
+the account menu. Its displayed `@commentary.foundryfx.example` address is a
+prototype-only placeholder; inbound email delivery and shared organization
+storage are not connected. Only commentary dated for the current UTC day can be
+sent to generation, and its use is off by default until the advisor enables
+the toggle.
 
 **Node.js (server side)**
 

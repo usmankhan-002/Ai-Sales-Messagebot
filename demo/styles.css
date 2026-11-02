@@ -101,6 +101,9 @@ body.ai-open .ai-tab { background: var(--brand-soft); color: var(--brand); box-s
 .hint { color: var(--faint); font-size: 12px; }
 .hint.is-error { color: var(--danger); }
 .empty { color: var(--faint); font-size: 13px; }
+.commentary-status { margin: 0 0 0 44px; }
+.commentary-status.is-active { color: var(--ok); }
+.email-preview { display: flex; align-items: center; gap: 8px; }
 
 /* ---- buttons ----------------------------------------------------------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 16px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: #fff; color: var(--ink); font-size: 13.5px; font-weight: 600; white-space: nowrap; transition: background .15s, border-color .15s, box-shadow .15s, transform .1s; }

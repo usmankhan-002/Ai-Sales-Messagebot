@@ -1,3 +1,5 @@
+from datetime import date
+
 from pydantic import BaseModel, Field
 
 
@@ -20,6 +22,9 @@ class SalesMessageRequest(BaseModel):
     tone: str | None = Field(default=None, max_length=120)
     sales_positioning: str | None = Field(default=None, max_length=2000)
     advisor_guidance: str | None = Field(default=None, max_length=12000)
+    market_commentary: str | None = Field(default=None, max_length=8000)
+    market_commentary_date: date | None = None
+    use_market_commentary: bool = False
     # Retained for older API consumers; new clients should send advisor_guidance.
     master_mkt_why: str | None = Field(default=None, max_length=4000)
     master_client_why: str | None = Field(default=None, max_length=4000)

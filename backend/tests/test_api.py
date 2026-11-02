@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from app import ai
@@ -122,6 +123,28 @@ def test_product_outline_is_included_as_background():
     msg = ai.build_user_message(req)
     assert "PRODUCT OVERVIEW" in msg
     assert "binding agreement" in msg
+
+
+def test_current_organization_market_commentary_is_included_only_when_enabled():
+    from datetime import timedelta
+
+    today = datetime.now(timezone.utc).date()
+    commentary = "The Australian dollar was lower at the close."
+    current = SalesMessageRequest(
+        product="FEC",
+        advisor_note="Discuss the hedge.",
+        market_commentary=commentary,
+        market_commentary_date=today,
+        use_market_commentary=True,
+    )
+    assert commentary in ai.build_user_message(current)
+
+    disabled = current.model_copy(update={"use_market_commentary": False})
+    stale = current.model_copy(update={"market_commentary_date": today - timedelta(days=1)})
+    future = current.model_copy(update={"market_commentary_date": today + timedelta(days=1)})
+    assert commentary not in ai.build_user_message(disabled)
+    assert commentary not in ai.build_user_message(stale)
+    assert commentary not in ai.build_user_message(future)
 
 
 def test_builder_message_carries_client_profile_and_ai_setup():

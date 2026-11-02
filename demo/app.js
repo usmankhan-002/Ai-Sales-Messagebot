@@ -5,6 +5,7 @@
   const KEYS = {
     clients: "foundryfx.clients", activeClient: "foundryfx.activeClient", legacyProfile: "foundryfx.clientProfile",
     prefs: "foundryfx.aiPreferences", shortcuts: "foundryfx.keyPointShortcuts", panel: "foundryfx.aiPanelOpen", ranking: "foundryfx.orgSalesRanking",
+    organization: "foundryfx.organizationProfile", marketCommentary: "foundryfx.orgMarketCommentary",
   };
   const store = {
     get(key, fallback) { try { const raw = localStorage.getItem(key); return raw == null ? fallback : JSON.parse(raw); } catch (_e) { return fallback; } },
@@ -39,6 +40,7 @@
     tone: "Consultative",
     salesPositioning: "Lead with the client's practical outcome, then make benefits and trade-offs explicit.",
     advisorGuidance: SAMPLE_ADVISOR_GUIDANCE,
+    useMarketCommentary: false,
   };
   const DEFAULT_RANKING_INDICATORS = [
     { id: "client-objectives", name: "References client objectives", guidance: "Connect the proposal to goals, priorities, or objectives explicitly present in the client context." },
@@ -68,6 +70,13 @@
   const savedRanking = store.get(KEYS.ranking, null);
   let orgRanking = { indicators: Array.isArray(savedRanking?.indicators) && savedRanking.indicators.length ? savedRanking.indicators : DEFAULT_RANKING_INDICATORS.map((item) => ({ ...item })) };
   let prefs = { ...DEFAULT_PREFS, ...savedPrefs };
+  const savedOrganization = store.get(KEYS.organization, {});
+  const savedCommentary = store.get(KEYS.marketCommentary, {});
+  let organization = { name: typeof savedOrganization?.name === "string" ? savedOrganization.name : "Foundry FX" };
+  let marketCommentary = {
+    date: typeof savedCommentary?.date === "string" ? savedCommentary.date : "",
+    text: typeof savedCommentary?.text === "string" ? savedCommentary.text : "",
+  };
   if (savedPrefs.advisorGuidance === PREVIOUS_DEFAULT_ADVISOR_GUIDANCE) {
     prefs.advisorGuidance = SAMPLE_ADVISOR_GUIDANCE;
   }
@@ -87,6 +96,14 @@
 
   // ---- helpers ------------------------------------------------------------
   function esc(value) { return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+  function utcToday() { return new Date().toISOString().slice(0, 10); }
+  function marketCommentaryEmail(name = organization.name) {
+    const slug = String(name || "organization").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "organization";
+    return `markets+${slug}@commentary.foundryfx.example`;
+  }
+  function hasCurrentMarketCommentary() {
+    return marketCommentary.date === utcToday() && typeof marketCommentary.text === "string" && !!marketCommentary.text.trim();
+  }
   function baseCcy(pair) { return String(pair || "").slice(0, 3); }
   function termCcy(pair) { return String(pair || "").slice(3, 6); }
   function substPlaceholders(text, pair, notionalCcy) {
@@ -123,11 +140,15 @@
     panel: $("aiPanel"), panelToggle: $("aiPanelToggle"), panelClose: $("aiPanelClose"), scrim: $("aiScrim"),
     ctxClient: $("ctxClient"), ctxProduct: $("ctxProduct"), ctxStyle: $("ctxStyle"),
     note: $("aiNote"), mic: $("micBtn"), draft: $("draftBtn"), draftLabel: $("draftBtnLabel"), status: $("aiStatus"),
-    toggleSubject: $("toggleSubject"), toggleAlt: $("toggleAlt"), history: $("aiHistory"), historyChips: $("aiHistoryChips"), historyCount: $("aiHistoryCount"),
+    toggleSubject: $("toggleSubject"), toggleAlt: $("toggleAlt"), toggleMarketCommentary: $("toggleMarketCommentary"), history: $("aiHistory"), historyChips: $("aiHistoryChips"), historyCount: $("aiHistoryCount"),
     alt: $("aiAlt"), altText: $("aiAltText"), useAlt: $("useAltBtn"),
     guidanceMarketWhy: $("guidanceMarketWhy"), guidanceClientWhy: $("guidanceClientWhy"), guidanceProductWhy: $("guidanceProductWhy"),
   };
   const prefEls = { writingStyle: $("prefWritingStyle"), tone: $("prefTone"), salesPositioning: $("prefPositioning"), advisorGuidance: $("prefAdvisorGuidance") };
+  const marketCommentaryEls = {
+    status: $("marketCommentaryStatus"), orgName: $("orgName"), email: $("marketCommentaryEmail"),
+    date: $("marketCommentaryDate"), text: $("marketCommentaryText"), savedStatus: $("marketCommentarySavedStatus"),
+  };
   const rankingUI = { card: $("rankingCard"), title: $("rankingTitle"), score: $("rankingScore"), meter: $("rankingMeter"), marker: $("rankingMarker"), note: $("rankingNote"), indicators: $("rankingIndicators") };
   const introRankingClasses = ["is-ranked", "is-red", "is-amber", "is-green", "is-ranking-stale"];
   function setIntroRanking(band) {
@@ -251,6 +272,7 @@
     const item = event.target.closest("[data-account]"); if (!item) return; setMenu(false);
     if (item.dataset.account === "clients") openClients("edit");
     else if (item.dataset.account === "ranking") openOrgRanking();
+    else if (item.dataset.account === "market-commentary") openMarketCommentary();
     else { openSetup(); if (item.dataset.account === "shortcuts") setTimeout(() => $("shortcutsSection").scrollIntoView({ behavior: "smooth", block: "start" }), 120); }
   });
 
@@ -279,6 +301,65 @@
     els.ctxProduct.textContent = deal.product ? `${displayPair(deal.pair)} · ${deal.product}` : "No product";
     els.ctxStyle.textContent = `${prefs.writingStyle || "Custom"} · ${prefs.tone || "custom tone"}`;
   }
+  function renderMarketCommentary() {
+    const available = hasCurrentMarketCommentary();
+    els.toggleMarketCommentary.disabled = !available;
+    if (!available) {
+      els.toggleMarketCommentary.checked = false;
+      marketCommentaryEls.status.textContent = marketCommentary.text
+        ? `No commentary saved for today (${utcToday()} UTC).`
+        : "No commentary saved for today.";
+      marketCommentaryEls.status.classList.remove("is-active");
+    } else {
+      els.toggleMarketCommentary.checked = !!prefs.useMarketCommentary;
+      marketCommentaryEls.status.textContent = prefs.useMarketCommentary
+        ? `Using organization commentary dated ${marketCommentary.date} UTC.`
+        : `Today’s commentary is available (${marketCommentary.date} UTC); toggle on to use it.`;
+      marketCommentaryEls.status.classList.toggle("is-active", !!prefs.useMarketCommentary);
+    }
+  }
+  function openMarketCommentary() {
+    marketCommentaryEls.orgName.value = organization.name;
+    marketCommentaryEls.email.value = marketCommentaryEmail();
+    marketCommentaryEls.date.value = marketCommentary.date || utcToday();
+    marketCommentaryEls.text.value = marketCommentary.text || "";
+    marketCommentaryEls.savedStatus.textContent = "";
+    openDrawer("marketCommentaryDrawer");
+  }
+  marketCommentaryEls.orgName.addEventListener("input", () => {
+    marketCommentaryEls.email.value = marketCommentaryEmail(marketCommentaryEls.orgName.value);
+  });
+  $("copyMarketCommentaryEmail").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(marketCommentaryEls.email.value);
+      toast("Prototype commentary address copied.", "ok");
+    } catch (error) {
+      toast("Could not copy the commentary address. Select and copy it manually.", "error");
+    }
+  });
+  $("saveMarketCommentary").addEventListener("click", () => {
+    const name = marketCommentaryEls.orgName.value.trim();
+    const date = marketCommentaryEls.date.value;
+    const text = marketCommentaryEls.text.value.trim();
+    if (!name) { toast("Enter an organization name.", "error"); marketCommentaryEls.orgName.focus(); return; }
+    if (!date) { toast("Choose the commentary date.", "error"); marketCommentaryEls.date.focus(); return; }
+    if (!text) { toast("Add the organization’s market commentary.", "error"); marketCommentaryEls.text.focus(); return; }
+    organization = { name };
+    marketCommentary = { date, text };
+    prefs.useMarketCommentary = false;
+    store.set(KEYS.organization, organization);
+    store.set(KEYS.marketCommentary, marketCommentary);
+    store.set(KEYS.prefs, prefs);
+    renderMarketCommentary();
+    marketCommentaryEls.savedStatus.textContent = `Saved for ${date} UTC.`;
+    toast(date === utcToday() ? "Today’s organization commentary saved." : "Commentary saved; it will only be available to AI on its matching date.", "ok");
+    closeDrawer("marketCommentaryDrawer");
+  });
+  els.toggleMarketCommentary.addEventListener("change", () => {
+    prefs.useMarketCommentary = els.toggleMarketCommentary.checked && hasCurrentMarketCommentary();
+    store.set(KEYS.prefs, prefs);
+    renderMarketCommentary();
+  });
   function renderGuidance() {
     const c = activeClient(); const copy = termsheetCopy(deal.product, deal.pair, deal.notionalCcy);
     els.guidanceMarketWhy.textContent = prefs.advisorGuidance || "Only the rationale in your key points.";
@@ -288,6 +369,7 @@
   }
 
   function buildPayload(note) {
+    renderMarketCommentary();
     const copy = termsheetCopy(deal.product, deal.pair, deal.notionalCcy); const c = activeClient();
     const dealTerms = { Pair: deal.pair, Direction: deal.direction, Notional: deal.notional };
     dynamicFieldsFor(getSchema(deal.product)).forEach((field) => { if (deal.fields[field.key]) dealTerms[field.label] = deal.fields[field.key]; });
@@ -296,6 +378,9 @@
       client_name: c.clientName || null, client_company: c.clientCompany || null, client_industry: c.clientIndustry || null, client_risk_appetite: c.riskAppetite || null,
       client_hedging_horizon: c.hedgingHorizon || null, client_functional_currency: c.functionalCurrency || null, client_notes: c.clientNotes || null,
       writing_style: prefs.writingStyle || null, tone: prefs.tone || null, sales_positioning: prefs.salesPositioning || null, advisor_guidance: prefs.advisorGuidance || null,
+      market_commentary: prefs.useMarketCommentary && hasCurrentMarketCommentary() ? marketCommentary.text : null,
+      market_commentary_date: prefs.useMarketCommentary && hasCurrentMarketCommentary() ? marketCommentary.date : null,
+      use_market_commentary: !!(prefs.useMarketCommentary && hasCurrentMarketCommentary()),
       suggest_subject: !!els.toggleSubject.checked, show_alternative: !!els.toggleAlt.checked,
     };
   }
@@ -621,7 +706,7 @@
   els.product.addEventListener("change", onProductChange);
   populateProductSelect();
   els.product.value = "Knock Out Conv. (LEV)" in (window.DEMO_PRODUCT_SCHEMAS || {}) ? "Knock Out Conv. (LEV)" : els.product.options[0]?.value || "";
-  onProductChange(); onClientsChanged(); renderShortcuts(); updateIntroCount();
+  onProductChange(); onClientsChanged(); renderShortcuts(); renderMarketCommentary(); updateIntroCount();
   setPanel(mobileQuery.matches ? false : store.get(KEYS.panel, true) !== false, false);
   mobileQuery.addEventListener?.("change", (e) => setPanel(e.matches ? false : store.get(KEYS.panel, true) !== false, false));
 })();
