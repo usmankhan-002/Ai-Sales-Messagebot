@@ -85,11 +85,38 @@ API from your backend**, not from browser code where users could read the key.
 
 Typical response time is 3–10 seconds; set a client timeout of about 30 seconds.
 
+### `POST /v1/ai/rank-sales-message`
+
+Same auth as above. Scores a drafted message 0–5 against organization indicators.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `message` | string | **yes** | The drafted message (max 8,000 chars) |
+| `indicators` | `{id, name, guidance}[]` | no | Up to 20. Empty or omitted = the service's 8 default indicators. IDs must be unique. |
+| `client_context` | string | no | Max 4,000 chars |
+| `deal_context` | string | no | Max 4,000 chars |
+
+Response `200`: `{"indicators": [{"id", "score", "evidence"}], "overall_score": 3.1, "band": "red" | "amber" | "green"}`
+(red < 2.3 ≤ amber < 3.8 ≤ green).
+
+### `POST /v1/ai/sms-summary`
+
+Same auth as above. Summarises a pitch into one SMS of at most 200 characters, ending with the deal link.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `sales_pitch` | string | **yes** | Max 8,000 chars |
+| `deal_link` | string | **yes** | Appended as `Deal: <link>` |
+
+Response `200`: `{"message": "… Deal: https://…"}`. Nothing is sent; the caller delivers the SMS.
+
 ### `POST /v1/ui/sales-message` (not for integrations)
 
 Used only by the service's own web page. It needs no key but rejects anything
 that isn't a same-origin browser request (`403`) and is rate-limited (`429`).
-Integrations must use `/v1/ai/sales-message` with a key.
+Integrations must use the `/v1/ai/*` endpoints with a key. In production, set
+`UI_ENABLED=false` so the keyless `/v1/ui/*` routes are switched off: their
+same-origin check relies on browser headers that a script can fake.
 
 The built-in page also uses `POST /v1/ui/rank-sales-message` to evaluate a draft
 against the organization indicators configured in the demo. It returns a 0–5

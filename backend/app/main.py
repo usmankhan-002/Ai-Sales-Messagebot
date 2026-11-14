@@ -36,9 +36,24 @@ class RankingIndicator(BaseModel):
     guidance: str = Field(..., min_length=1, max_length=500)
 
 
+# Used when a caller sends no indicators of its own (e.g. an org that has not
+# configured any yet), so every integration gets the same baseline rubric.
+DEFAULT_RANKING_INDICATORS: list[dict] = [
+    {"id": "client-objectives", "name": "References client objectives", "guidance": "Connect the proposal to goals, priorities, or objectives explicitly present in the client context."},
+    {"id": "strong-close", "name": "Has a strong close", "guidance": "End with a clear, appropriate close that invites a decision or response without overstating."},
+    {"id": "clear-next-steps", "name": "Clear next steps", "guidance": "State a concrete next action for the advisor or client when supported by context."},
+    {"id": "client-profile-alignment", "name": "Aligns to client profile", "guidance": "Tailor the wording to the supplied client profile, risk appetite, horizon, or industry where relevant."},
+    {"id": "appropriate-urgency", "name": "Sense of urgency", "guidance": "Give a timely reason to act only when supported by supplied facts; do not create pressure or false urgency."},
+    {"id": "trade-confirmation-link", "name": "Click link to confirm trade", "guidance": "Reference a trade confirmation or execution link only when one is actually supplied in the message or deal context."},
+    {"id": "ongoing-engagement", "name": "Ongoing communication / engagement", "guidance": "Invite continued discussion, follow-up, or ongoing engagement in a way that fits the relationship."},
+    {"id": "deal-parameter-alignment", "name": "Aligns to priced product parameters", "guidance": "Keep product description aligned with the supplied structure, currency pair, rates, levels, and other deal parameters; preserve them exactly."},
+]
+
+
 class RankMessageRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
-    indicators: list[RankingIndicator] = Field(..., min_length=1, max_length=20)
+    # Empty = use DEFAULT_RANKING_INDICATORS.
+    indicators: list[RankingIndicator] = Field(default_factory=list, max_length=20)
     client_context: str | None = Field(default=None, max_length=4000)
     deal_context: str | None = Field(default=None, max_length=4000)
 
@@ -277,6 +292,21 @@ def ui_sales_message(
     tags=["ui"],
 )
 def ui_sms_summary(req: SmsSummaryRequest, client: OpenAI = Depends(get_client)):
+    return _sms_summary(req, client)
+
+
+@app.post(
+    "/v1/ai/sms-summary",
+    response_model=SmsSummaryResponse,
+    dependencies=[Depends(require_token), Depends(require_ai_access)],
+    tags=["ai"],
+)
+def sms_summary(req: SmsSummaryRequest, client: OpenAI = Depends(get_client)):
+    """Integration endpoint: requires the API key when AI_API_TOKEN is set."""
+    return _sms_summary(req, client)
+
+
+def _sms_summary(req: SmsSummaryRequest, client: OpenAI) -> SmsSummaryResponse:
     link_suffix = f" Deal: {req.deal_link}"
     if len(link_suffix) > 200:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The deal link is too long for a 200-character SMS.")
@@ -313,6 +343,25 @@ def ui_sms_summary(req: SmsSummaryRequest, client: OpenAI = Depends(get_client))
     tags=["ui"],
 )
 def ui_rank_sales_message(req: RankMessageRequest, client: OpenAI = Depends(get_client)):
+    return _rank_message(req, client)
+
+
+@app.post(
+    "/v1/ai/rank-sales-message",
+    response_model=RankMessageResponse,
+    dependencies=[Depends(require_token), Depends(require_ai_access)],
+    tags=["ai"],
+)
+def rank_sales_message(req: RankMessageRequest, client: OpenAI = Depends(get_client)):
+    """Integration endpoint: requires the API key when AI_API_TOKEN is set."""
+    return _rank_message(req, client)
+
+
+def _rank_message(req: RankMessageRequest, client: OpenAI) -> RankMessageResponse:
+    if not req.indicators:
+        req = req.model_copy(
+            update={"indicators": [RankingIndicator(**item) for item in DEFAULT_RANKING_INDICATORS]}
+        )
     if len({indicator.id for indicator in req.indicators}) != len(req.indicators):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Indicator IDs must be unique.")
     rubric = [{"id": item.id, "name": item.name, "guidance": item.guidance} for item in req.indicators]
