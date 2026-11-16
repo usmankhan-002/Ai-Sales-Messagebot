@@ -6,11 +6,45 @@
     clients: "foundryfx.clients", activeClient: "foundryfx.activeClient", legacyProfile: "foundryfx.clientProfile",
     prefs: "foundryfx.aiPreferences", shortcuts: "foundryfx.keyPointShortcuts", panel: "foundryfx.aiPanelOpen", ranking: "foundryfx.orgSalesRanking",
     organization: "foundryfx.organizationProfile", marketCommentary: "foundryfx.orgMarketCommentary",
+    orgId: "foundryfx.orgId", uploadedClients: "foundryfx.uploadedClientsForOrg",
   };
   const store = {
     get(key, fallback) { try { const raw = localStorage.getItem(key); return raw == null ? fallback : JSON.parse(raw); } catch (_e) { return fallback; } },
     set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (_e) { /* works without storage */ } },
   };
+
+  // Organization data (market commentary, ranking indicators) lives in the
+  // bot's database when the server has one; localStorage is the fallback/cache.
+  // Organizations, clients, market commentary and ranking indicators live in
+  // the bot's database when the server has one; localStorage is the fallback.
+  const orgDb = {
+    available: false,
+    orgId: "",
+    async request(path, options = {}) {
+      const headers = { "content-type": "application/json", ...(this.orgId ? { "X-Org-Id": this.orgId } : {}), ...(options.headers || {}) };
+      const response = await fetch(`/v1/ui/${path}`, { ...options, headers });
+      if (response.status === 404 && (options.method || "GET") === "GET") return null;
+      if (response.status === 204) return null;
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try { const body = await response.json(); if (typeof body.detail === "string") detail = body.detail; } catch (_e) {}
+        throw new Error(detail);
+      }
+      return response.json();
+    },
+    get(path) { return this.request(path); },
+    put(path, body) { return this.request(path, { method: "PUT", body: JSON.stringify(body) }); },
+    post(path, body) { return this.request(path, { method: "POST", body: JSON.stringify(body) }); },
+    patch(path, body) { return this.request(path, { method: "PATCH", body: JSON.stringify(body) }); },
+    del(path) { return this.request(path, { method: "DELETE" }); },
+  };
+  // Page client fields <-> bot clients table columns.
+  const CLIENT_API_FIELDS = {
+    clientName: "full_name", clientCompany: "company", clientEmail: "email", clientPhone: "phone", clientIndustry: "industry",
+    riskAppetite: "risk_appetite", hedgingHorizon: "hedging_horizon", functionalCurrency: "functional_currency", clientNotes: "notes",
+  };
+  function clientToApi(c) { const out = {}; Object.entries(CLIENT_API_FIELDS).forEach(([page, api]) => { out[api] = (c[page] || "").trim() || null; }); return out; }
+  function clientFromApi(row) { const out = { id: row.id }; Object.entries(CLIENT_API_FIELDS).forEach(([page, api]) => { out[page] = row[api] || ""; }); return out; }
 
   const DEFAULT_CLIENTS = [
     { id: "c-novik", clientName: "Ada Novik", clientCompany: "Novik Trading", clientEmail: "ada.novik@example.com", clientIndustry: "Import & distribution", riskAppetite: "Balanced", hedgingHorizon: "3–12 months", functionalCurrency: "AUD", clientNotes: "Budget rate 0.7200 AUD/USD · needs USD 3m per month · hedges out 12 months." },
@@ -238,24 +272,41 @@
   }
   $("clientList").addEventListener("click", (event) => { const btn = event.target.closest("[data-client]"); if (!btn) return; editingId = btn.dataset.client; fillClientForm(clients.find((c) => c.id === editingId) || {}); renderClientList(); });
   $("newClientBtn").addEventListener("click", () => { editingId = ""; fillClientForm({}); renderClientList(); $("cfName").focus(); });
-  clientForm.addEventListener("submit", (event) => {
+  clientForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = {}; clientInputs.forEach((input) => { data[input.dataset.key] = input.value.trim(); });
     if (!data.clientName && !data.clientCompany) { toast("Add a contact name or company first.", "error"); $("cfName").focus(); return; }
-    if (editingId) { clients = clients.map((c) => (c.id === editingId ? { ...c, ...data } : c)); }
+    if (orgDb.available && orgDb.orgId) {
+      try {
+        const saved = editingId
+          ? await orgDb.put(`clients/${editingId}`, clientToApi(data))
+          : await orgDb.post("clients", clientToApi(data));
+        const row = clientFromApi(saved);
+        if (editingId) clients = clients.map((c) => (c.id === editingId ? row : c)); else clients.push(row);
+        editingId = row.id;
+      } catch (error) { toast(`Couldn't save the client: ${error.message}`, "error"); return; }
+    } else if (editingId) { clients = clients.map((c) => (c.id === editingId ? { ...c, ...data } : c)); }
     else { editingId = `c-${Date.now().toString(36)}`; clients.push({ id: editingId, ...data }); }
+    const switchedClient = activeClientId !== editingId;
     activeClientId = editingId; saveClients(); onClientsChanged(); renderClientList(); fillClientForm(activeClient());
+    if (orgDb.available && switchedClient) { clearActiveDraft(); reloadDraftHistory(); }
     toast(`Saved ${data.clientCompany || data.clientName}.`, "ok");
   });
-  $("deleteClientBtn").addEventListener("click", () => {
+  $("deleteClientBtn").addEventListener("click", async () => {
     const c = clients.find((x) => x.id === editingId); if (!c) return;
-    if (!window.confirm(`Delete ${c.clientCompany || c.clientName}? This can't be undone.`)) return;
+    if (!window.confirm(`Delete ${c.clientCompany || c.clientName}? Their saved drafts are deleted too. This can't be undone.`)) return;
+    if (orgDb.available && orgDb.orgId) {
+      try { await orgDb.del(`clients/${editingId}`); } catch (error) { toast(`Couldn't delete the client: ${error.message}`, "error"); return; }
+    }
     clients = clients.filter((x) => x.id !== editingId);
     if (activeClientId === editingId) activeClientId = clients[0]?.id || "";
     editingId = activeClientId; saveClients(); onClientsChanged(); renderClientList(); fillClientForm(activeClient());
     toast("Client deleted.");
   });
-  els.client.addEventListener("change", () => { activeClientId = els.client.value; saveClients(); renderClientSummary(); renderContext(); renderGuidance(); });
+  els.client.addEventListener("change", () => {
+    activeClientId = els.client.value; saveClients(); renderClientSummary(); renderContext(); renderGuidance();
+    if (orgDb.available) { clearActiveDraft(); reloadDraftHistory(); }
+  });
   els.clientSummary.addEventListener("click", (event) => { const btn = event.target.closest("[data-open-clients]"); if (btn) openClients(btn.dataset.openClients); });
   $("openClients").addEventListener("click", () => openClients("edit"));
 
@@ -344,12 +395,19 @@
     if (!name) { toast("Enter an organization name.", "error"); marketCommentaryEls.orgName.focus(); return; }
     if (!date) { toast("Choose the commentary date.", "error"); marketCommentaryEls.date.focus(); return; }
     if (!text) { toast("Add the organization’s market commentary.", "error"); marketCommentaryEls.text.focus(); return; }
+    if (orgDb.available && orgDb.orgId && name !== organization.name) {
+      orgDb.patch(`orgs/${orgDb.orgId}`, { name }).then(() => loadOrgList()).catch(() => toast("Couldn't rename the organization in the database.", "error"));
+    }
     organization = { name };
     marketCommentary = { date, text };
     prefs.useMarketCommentary = false;
     store.set(KEYS.organization, organization);
     store.set(KEYS.marketCommentary, marketCommentary);
     store.set(KEYS.prefs, prefs);
+    if (orgDb.available) {
+      orgDb.put("org/market-commentary", { date, text })
+        .catch(() => toast("Saved on this device only: the shared database could not be reached.", "error"));
+    }
     renderMarketCommentary();
     marketCommentaryEls.savedStatus.textContent = `Saved for ${date} UTC.`;
     toast(date === utcToday() ? "Today’s organization commentary saved." : "Commentary saved; it will only be available to AI on its matching date.", "ok");
@@ -382,18 +440,19 @@
       market_commentary_date: prefs.useMarketCommentary && hasCurrentMarketCommentary() ? marketCommentary.date : null,
       use_market_commentary: !!(prefs.useMarketCommentary && hasCurrentMarketCommentary()),
       suggest_subject: !!els.toggleSubject.checked, show_alternative: !!els.toggleAlt.checked,
+      client_id: orgDb.available && /^[0-9a-f-]{36}$/i.test(c.id || "") ? c.id : null,
     };
   }
   async function draftNote(note) {
     // The built-in page uses the keyless, rate-limited UI endpoint; integrations use /v1/ai/sales-message with a key.
-    const response = await fetch("/v1/ui/sales-message", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(buildPayload(note)) });
+    const response = await fetch("/v1/ui/sales-message", { method: "POST", headers: { "content-type": "application/json", ...(orgDb.orgId ? { "X-Org-Id": orgDb.orgId } : {}) }, body: JSON.stringify(buildPayload(note)) });
     if (!response.ok) {
       let detail = response.statusText;
       try { const body = await response.json(); detail = typeof body.detail === "string" ? body.detail : Array.isArray(body.detail) ? body.detail.map((d) => d.msg).join("; ") : detail; } catch (_e) {}
       throw new Error(detail || `HTTP ${response.status}`);
     }
     const data = await response.json();
-    return { message: String(data.message || "").trim(), subject: data.subject ? String(data.subject).trim() : "", alternative: data.alternative_message ? String(data.alternative_message).trim() : "" };
+    return { message: String(data.message || "").trim(), subject: data.subject ? String(data.subject).trim() : "", alternative: data.alternative_message ? String(data.alternative_message).trim() : "", draftId: data.draft_id || null };
   }
 
   function indicatorBand(score) { return score < 2.3 ? "red" : score < 3.8 ? "amber" : "green"; }
@@ -408,9 +467,10 @@
     const payload = buildPayload(els.note.value.trim() || message);
     const dealContext = JSON.stringify({ product: payload.product, product_family: payload.product_family, deal_terms: payload.deal_terms, product_outline: payload.product_outline, product_benefits: payload.product_benefits, product_risks: payload.product_risks });
     try {
+      const draftId = history[historyIndex]?.draftId || null;
       const response = await fetch("/v1/ui/rank-sales-message", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message, indicators: orgRanking.indicators, client_context: clientContext, deal_context: dealContext }),
+        method: "POST", headers: { "content-type": "application/json", ...(orgDb.orgId ? { "X-Org-Id": orgDb.orgId } : {}) },
+        body: JSON.stringify({ message, indicators: orgRanking.indicators, client_context: clientContext, deal_context: dealContext, draft_id: draftId, client_id: payload.client_id }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
@@ -450,10 +510,10 @@
   els.intro.addEventListener("input", updateIntroCount);
 
   const history = []; let historyIndex = -1; let pendingAlternative = "";
-  function addHistoryDraft(message) {
+  function addHistoryDraft(message, draftId = null) {
     const product = deal.product || "Sales message";
     const sequence = history.filter((draft) => draft.product === product).reduce((max, draft) => Math.max(max, draft.sequence), 0) + 1;
-    history.push({ message, product, sequence, name: `${product} draft ${sequence}` });
+    history.push({ message, product, sequence, name: `${product} draft ${sequence}`, draftId });
     historyIndex = history.length - 1;
   }
   function renderHistory() {
@@ -468,7 +528,11 @@
     const remove = event.target.closest("[data-delete-draft]");
     if (remove) {
       const index = Number(remove.dataset.deleteDraft); const wasActive = index === historyIndex;
-      history.splice(index, 1);
+      const [removed] = history.splice(index, 1);
+      // Delete the saved draft too, unless another strip entry (its alternative) still uses it.
+      if (orgDb.available && removed?.draftId && !history.some((d) => d.draftId === removed.draftId)) {
+        orgDb.del(`drafts/${removed.draftId}`).catch(() => toast("Removed here, but couldn't delete the saved draft.", "error"));
+      }
       if (!history.length) { historyIndex = -1; renderHistory(); clearActiveDraft(); setStatus("Draft removed.", "ok"); return; }
       if (index < historyIndex) historyIndex -= 1;
       else if (wasActive) historyIndex = Math.min(index, history.length - 1);
@@ -481,6 +545,7 @@
     setStatus(`Restored ${history[historyIndex].name}.`, "ok"); rankSalesMessage(history[historyIndex].message);
   });
 
+  let lastDraftId = null;
   els.draft.addEventListener("click", async () => {
     const note = els.note.value.trim();
     if (!note) { setStatus("Add a few key points first.", "error"); els.note.focus(); return; }
@@ -489,7 +554,7 @@
     syncDealFromInputs(); els.draft.disabled = true; els.draft.classList.add("is-loading"); els.draftLabel.textContent = "Writing your message…"; setStatus("", ""); els.alt.hidden = true;
     try {
       const result = await draftNote(note);
-      addHistoryDraft(result.message); setIntro(result.message); renderHistory();
+      addHistoryDraft(result.message, result.draftId); lastDraftId = result.draftId; setIntro(result.message); renderHistory();
       if (result.subject) {
         suggestedSubject = result.subject;
         els.subject.value = result.subject;
@@ -500,7 +565,7 @@
     } catch (error) { setStatus(`Couldn't draft: ${error?.message || "unknown error"}`, "error"); }
     finally { els.draft.disabled = false; els.draft.classList.remove("is-loading"); els.draftLabel.textContent = "Draft intro message"; }
   });
-  els.useAlt.addEventListener("click", () => { if (!pendingAlternative) return; addHistoryDraft(pendingAlternative); setIntro(pendingAlternative); renderHistory(); els.alt.hidden = true; setStatus("Switched to the alternative.", "ok"); rankSalesMessage(pendingAlternative); });
+  els.useAlt.addEventListener("click", () => { if (!pendingAlternative) return; addHistoryDraft(pendingAlternative, lastDraftId); setIntro(pendingAlternative); renderHistory(); els.alt.hidden = true; setStatus("Switched to the alternative.", "ok"); rankSalesMessage(pendingAlternative); });
   els.copyIntro.addEventListener("click", async () => {
     if (!els.intro.value.trim()) { toast("Nothing to copy yet.", "error"); return; }
     try { await navigator.clipboard.writeText(els.intro.value); toast("Intro message copied.", "ok"); } catch (_e) { toast("Couldn't copy. Select the text and copy it manually.", "error"); }
@@ -584,7 +649,12 @@
     if (!rankingDraft.length) { toast("Keep at least one ranking indicator.", "error"); return; }
     const incomplete = rankingDraft.findIndex((indicator) => !indicator.name || !indicator.guidance);
     if (incomplete >= 0) { toast("Complete each indicator name and scoring guidance.", "error"); $(`rankingName${incomplete}`).focus(); return; }
-    orgRanking = { indicators: rankingDraft.map((indicator) => ({ ...indicator })) }; store.set(KEYS.ranking, orgRanking); renderRankingMethodology(); closeDrawer("orgRankingDrawer"); toast("Organization ranking indicators saved.", "ok");
+    orgRanking = { indicators: rankingDraft.map((indicator) => ({ ...indicator })) }; store.set(KEYS.ranking, orgRanking);
+    if (orgDb.available) {
+      orgDb.put("org/ranking-indicators", { indicators: orgRanking.indicators })
+        .catch(() => toast("Saved on this device only: the shared database could not be reached.", "error"));
+    }
+    renderRankingMethodology(); closeDrawer("orgRankingDrawer"); toast("Organization ranking indicators saved.", "ok");
   });
   $("saveSetup").addEventListener("click", () => {
     Object.keys(prefEls).forEach((key) => { prefs[key] = prefEls[key].value.trim(); });
@@ -709,4 +779,103 @@
   onProductChange(); onClientsChanged(); renderShortcuts(); renderMarketCommentary(); updateIntroCount();
   setPanel(mobileQuery.matches ? false : store.get(KEYS.panel, true) !== false, false);
   mobileQuery.addEventListener?.("change", (e) => setPanel(e.matches ? false : store.get(KEYS.panel, true) !== false, false));
+
+  // ---- shared organization data (bot database) ------------------------------
+  const orgEls = { wrap: $("orgSwitch"), select: $("orgSelect") };
+  let orgList = [];
+  async function loadOrgList() {
+    orgList = (await orgDb.get("orgs"))?.orgs || [];
+    orgEls.select.innerHTML = orgList.map((o) => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join("") + `<option value="__new">+ New organization…</option>`;
+    orgEls.select.value = orgDb.orgId;
+    orgEls.wrap.hidden = false;
+  }
+  async function loadOrgData() {
+    const org = orgList.find((o) => o.id === orgDb.orgId);
+    if (org) { organization = { name: org.name }; store.set(KEYS.organization, organization); }
+    // Clients: the first time this browser links to an org that has none, upload its local
+    // ones. The server imports only into an empty org (atomically), so a second tab can't
+    // upload the same clients twice.
+    let rows = (await orgDb.get("clients"))?.clients || [];
+    const uploaded = store.get(KEYS.uploadedClients, {}) || {};
+    if (!rows.length && !uploaded[orgDb.orgId] && clients.length) {
+      rows = (await orgDb.post("clients/import", { clients: clients.map(clientToApi) }))?.clients || [];
+    }
+    uploaded[orgDb.orgId] = true; store.set(KEYS.uploadedClients, uploaded);
+    const localActive = clients.find((c) => c.id === activeClientId);
+    clients = rows.map(clientFromApi);
+    if (!clients.some((c) => c.id === activeClientId)) {
+      // Keep the same client selected after upload (local ids become database ids).
+      const same = localActive && clients.find((c) => c.clientName === localActive.clientName && c.clientCompany === localActive.clientCompany);
+      activeClientId = same?.id || clients[0]?.id || "";
+    }
+    saveClients(); onClientsChanged();
+    await loadDraftHistory();
+
+    const [commentary, ranking] = await Promise.all([
+      orgDb.get(`org/market-commentary?date=${utcToday()}`),
+      orgDb.get("org/ranking-indicators"),
+    ]);
+    marketCommentary = commentary?.text ? { date: commentary.date, text: commentary.text } : { date: "", text: "" };
+    store.set(KEYS.marketCommentary, marketCommentary);
+    renderMarketCommentary();
+    const saved = ranking?.source === "organization" && Array.isArray(ranking.indicators) && ranking.indicators.length ? ranking.indicators : DEFAULT_RANKING_INDICATORS;
+    orgRanking = { indicators: saved.map((indicator) => ({ ...indicator })) };
+    store.set(KEYS.ranking, orgRanking);
+    renderRankingMethodology();
+  }
+  // Saved drafts for the selected client, oldest first, so the strip survives a refresh.
+  async function loadDraftHistory() {
+    const c = activeClient();
+    const rows = orgDb.available && /^[0-9a-f-]{36}$/i.test(c.id || "")
+      ? ((await orgDb.get(`drafts?client_id=${encodeURIComponent(c.id)}&limit=20`))?.drafts || [])
+      : [];
+    history.length = 0; historyIndex = -1;
+    rows.filter((d) => d.kind === "sales_message").reverse().forEach((d) => {
+      const product = d.product || "Sales message";
+      const sequence = history.filter((x) => x.product === product).length + 1;
+      history.push({ message: d.message, product, sequence, name: `${product} draft ${sequence}`, draftId: d.id });
+    });
+    renderHistory();
+  }
+  function reloadDraftHistory() {
+    loadDraftHistory().catch(() => toast("Couldn't load saved drafts for this client.", "error"));
+  }
+  async function switchOrg(orgId) {
+    orgDb.orgId = orgId; store.set(KEYS.orgId, orgId); orgEls.select.value = orgId;
+    history.length = 0; historyIndex = -1; renderHistory(); clearActiveDraft();
+    await loadOrgData();
+  }
+  orgEls.select.addEventListener("change", async () => {
+    try {
+      if (orgEls.select.value === "__new") {
+        const name = (window.prompt("New organization name") || "").trim();
+        if (!name) { orgEls.select.value = orgDb.orgId; return; }
+        const org = await orgDb.post("orgs", { name });
+        await loadOrgList(); await switchOrg(org.id);
+        toast(`Created ${name}.`, "ok");
+      } else {
+        await switchOrg(orgEls.select.value);
+        toast(`Switched to ${organization.name}.`, "ok");
+      }
+    } catch (error) { toast(`Couldn't switch organization: ${error.message}`, "error"); orgEls.select.value = orgDb.orgId; }
+  });
+
+  (async function loadSharedOrgData() {
+    try {
+      const health = await fetch("/healthz").then((r) => r.json());
+      if (health?.database !== "ok") return;
+      orgDb.available = true;
+      await loadOrgList();
+      let orgId = store.get(KEYS.orgId, "");
+      if (!orgList.some((o) => o.id === orgId)) orgId = orgList[0]?.id || "";
+      if (!orgId) {
+        const org = await orgDb.post("orgs", { name: organization.name || "Foundry FX" });
+        await loadOrgList(); orgId = org.id;
+      }
+      await switchOrg(orgId);
+    } catch (_e) {
+      // Keep working from this browser's saved copy.
+      orgDb.available = false; orgDb.orgId = ""; orgEls.wrap.hidden = true;
+    }
+  })();
 })();

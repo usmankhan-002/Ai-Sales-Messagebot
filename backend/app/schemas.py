@@ -1,3 +1,4 @@
+import uuid
 from datetime import date
 
 from pydantic import BaseModel, Field
@@ -31,6 +32,8 @@ class SalesMessageRequest(BaseModel):
     master_product_why: str | None = Field(default=None, max_length=4000)
     suggest_subject: bool = False
     show_alternative: bool = False
+    # Bot client this draft is for (stored with the draft; not sent to the model).
+    client_id: uuid.UUID | None = None
 
 
 class SalesMessageResponse(BaseModel):
@@ -39,3 +42,5 @@ class SalesMessageResponse(BaseModel):
     alternative_message: str | None = None
     model: str
     generated_at: str
+    # Id of the saved draft (null when no database); pass it to rank-sales-message.
+    draft_id: int | None = None

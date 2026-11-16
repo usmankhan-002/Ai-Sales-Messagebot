@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     ui_rate_limit: int = int(os.getenv("UI_RATE_LIMIT", "30"))
     ui_rate_limit_global: int = int(os.getenv("UI_RATE_LIMIT_GLOBAL", "300"))
     ui_rate_window_seconds: int = int(os.getenv("UI_RATE_WINDOW_SECONDS", "600"))
+    # Neon Postgres connection string (pooled). Empty = no database.
+    database_url: str = os.getenv("DATABASE_URL", "")
+    # Drafts (and their rankings) hold client details: delete them after this many days. 0 = keep.
+    draft_retention_days: int = int(os.getenv("DRAFT_RETENTION_DAYS", "90"))
+    # The usage log holds no client details. 0 = keep.
+    usage_retention_days: int = int(os.getenv("USAGE_RETENTION_DAYS", "365"))
 
     model_config = {"case_sensitive": False}
 
@@ -55,6 +61,10 @@ class Settings(BaseSettings):
     @property
     def key_configured(self) -> bool:
         return bool(self.openai_api_key) and not self.openai_api_key.startswith("sk-...")
+
+    @property
+    def db_configured(self) -> bool:
+        return bool(self.database_url.strip())
 
     @property
     def auth_required(self) -> bool:

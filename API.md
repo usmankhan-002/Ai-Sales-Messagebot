@@ -125,7 +125,71 @@ and rate limits and is not an integration API.
 
 ### `GET /healthz`
 
-No key needed. Returns `{"status": "ok", "key_configured": true, "auth_required": true}`.
+No key needed. Returns `{"status": "ok", "key_configured": true, "auth_required": true, "database": "ok", …}`.
+`database` is `ok`, `error` (set but unreachable) or `not_configured`.
+
+---
+
+## Stored data (bot database)
+
+When `DATABASE_URL` is set, the bot keeps its own records in its own Neon
+database (`AISalesMessage_bot`). Tables and columns follow the Trade Builder's
+naming (UUID ids, `full_name`, `for_date`/`body`, `ranking_indicators`), but they
+are the bot's own records: the bot never reads or writes the Trade Builder
+database. Missing tables are created on startup.
+
+| Table | Holds |
+|---|---|
+| `organizations` | The bot's organizations (`id` UUID, `name`, `sector`, `status`) |
+| `clients` | Client profiles per organization: `full_name`, `company`, `email`, `phone`, `type`, `industry`, `risk_appetite`, `hedging_horizon`, `functional_currency`, `notes` |
+| `org_market_commentary` | One commentary entry per organization per date (`for_date`, `body`) |
+| `org_ai_settings` | The organization's ranking rubric (`ranking_indicators`) |
+| `ai_drafts` | Every generated sales message and SMS, with the input it was given |
+| `ai_rankings` | Every ranking: rubric used, per-indicator scores, overall score and band |
+| `ai_usage_log` | One row per AI call: endpoint, model, status, latency, error (no client details) |
+
+**Organization scope.** Send `X-Org-Id: <organization id>` to read and write an
+organization's data. On AI calls it's optional. When it names a bot organization:
+- `sales-message` with `use_market_commentary: true` and no `market_commentary`
+  uses that organization's saved commentary for today (UTC).
+- `rank-sales-message` with no `indicators` uses that organization's saved rubric, then the default.
+- The draft, ranking and usage row are filed under that organization.
+
+**Linking.** `sales-message` and `sms-summary` accept an optional `client_id`
+(a client in that organization). `sales-message` returns `draft_id`; pass it to
+`rank-sales-message` so the ranking is stored against that draft.
+
+**Client data retention.**
+- Drafts and their rankings are deleted after `DRAFT_RETENTION_DAYS` (default 90).
+- Usage rows are deleted after `USAGE_RETENTION_DAYS` (default 365). `0` keeps them forever.
+- Cleanup runs at startup and then daily.
+- Deleting a client also deletes every draft and ranking filed under them.
+
+Recording is best-effort: if the database is down, AI calls still succeed.
+The endpoints below need the API key. All except `/v1/orgs` also need `X-Org-Id`.
+Without a database they return `503`.
+
+| Method & path | Body / query | Returns |
+|---|---|---|
+| `GET /v1/orgs` | | `{orgs: [...]}` |
+| `POST /v1/orgs` | `{"name", "sector"?}` | `201` + the organization |
+| `PATCH /v1/orgs/{id}` | `{"name"?, "sector"?}` | The organization |
+| `GET /v1/clients` | `?include_inactive=false` | `{clients: [...]}` |
+| `POST /v1/clients` | client fields above (`full_name` or `company` required) | `201` + the client |
+| `PUT /v1/clients/{id}` | client fields to change (blank = clear) | The client |
+| `DELETE /v1/clients/{id}` | | `204`; also deletes their drafts and rankings |
+| `GET /v1/org/market-commentary` | `?date=YYYY-MM-DD` (default today UTC) | `{org_id, date, text, updated_by, updated_at}`, or `404` |
+| `PUT /v1/org/market-commentary` | `{"date"?: "YYYY-MM-DD", "text": "…"}` | Saves or replaces that date's entry |
+| `GET /v1/org/ranking-indicators` | | `{indicators, source}` where `source` is `organization` or `default` |
+| `PUT /v1/org/ranking-indicators` | `{"indicators": [{id, name, guidance}]}` (1–20, unique ids) | The saved rubric |
+| `GET /v1/drafts` | `?client_id=&deal_id=&user_id=&limit=20` (max 100) | `{drafts: [...]}`, newest first, each with its latest `ranking` |
+| `GET /v1/rankings/summary` | `?days=30` (max 365) | `{rankings, average_score, bands: {green, amber, red}}` |
+
+The built-in page uses the same organization, client, commentary and ranking
+routes under `/v1/ui/...`. These need no key, so they are same-origin only, with
+writes rate-limited. The page has no login: anyone who can open it can pick any
+organization and see its clients. In production, set `UI_ENABLED=false`, or put
+the page behind a login.
 
 ---
 
