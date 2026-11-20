@@ -1,20 +1,27 @@
+import asyncio
 import secrets
+import uuid
 import json
 import logging
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from .import ai
+from .import ai, storage
 from .config import settings
+from .db import db_status, init_db
 from .schemas import SalesMessageRequest, SalesMessageResponse
 
 DEMO_DIR = Path(__file__).resolve().parents[2] / "demo"
@@ -24,6 +31,7 @@ logger = logging.getLogger(__name__)
 class SmsSummaryRequest(BaseModel):
     sales_pitch: str = Field(..., min_length=1, max_length=8000)
     deal_link: str = Field(..., min_length=1, max_length=1000)
+    client_id: uuid.UUID | None = None  # bot client, to file the draft under
 
 
 class SmsSummaryResponse(BaseModel):
@@ -56,6 +64,9 @@ class RankMessageRequest(BaseModel):
     indicators: list[RankingIndicator] = Field(default_factory=list, max_length=20)
     client_context: str | None = Field(default=None, max_length=4000)
     deal_context: str | None = Field(default=None, max_length=4000)
+    # Optional links so the stored ranking can be tied to a saved draft/client.
+    draft_id: int | None = Field(default=None, ge=1)
+    client_id: uuid.UUID | None = None
 
 
 class RankedIndicator(BaseModel):
@@ -132,6 +143,38 @@ def _org_id_from_request(request: Request) -> str | None:
     return None
 
 
+def _header(request: Request, *names: str) -> str | None:
+    for name in names:
+        value = request.headers.get(name, "").strip()
+        if value:
+            return value[:128]
+    return None
+
+
+def _is_demo_page(request: Request) -> bool:
+    return bool(getattr(request.state, "demo_page", False))
+
+
+_UNRESOLVED = object()
+
+
+def _storage_org_id(request: Request) -> uuid.UUID | None:
+    """The bot organization named by X-Org-Id, if it exists in the bot database."""
+    cached = getattr(request.state, "bot_org", _UNRESOLVED)
+    if cached is _UNRESOLVED:
+        cached = storage.try_resolve_org(_org_id_from_request(request))
+        request.state.bot_org = cached
+    return cached
+
+
+def _user_id_from_request(request: Request) -> str | None:
+    return None if _is_demo_page(request) else _header(request, "x-user-id")
+
+
+def _deal_id_from_request(request: Request) -> str | None:
+    return None if _is_demo_page(request) else _header(request, "x-deal-id")
+
+
 def _role_from_request(request: Request) -> str | None:
     for header_name in ("x-user-role", "x-role", "role"):
         value = request.headers.get(header_name, "").strip()
@@ -175,18 +218,47 @@ def require_ai_access(request: Request) -> None:
             )
 
 
-app = FastAPI(title="Foundry FX — AI Sales Message", version="0.1.0")
+def _purge_once() -> None:
+    try:
+        removed = storage.purge_expired()
+        if any(removed.values()):
+            logger.info("Retention cleanup removed %s", removed)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Retention cleanup failed: %s", type(exc).__name__)
+
+
+async def _retention_loop() -> None:
+    while True:
+        await asyncio.to_thread(_purge_once)
+        await asyncio.sleep(24 * 3600)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Creates the bot's own tables if they don't exist, then runs retention daily.
+    task = None
+    if init_db():
+        logger.info("Database ready.")
+        task = asyncio.create_task(_retention_loop())
+    yield
+    if task:
+        task.cancel()
+
+
+app = FastAPI(title="Foundry FX — AI Sales Message", version="0.1.0", lifespan=lifespan)
 
 if settings.cors_origin_list:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
-        allow_methods=["POST", "GET", "OPTIONS"],
+        allow_methods=["POST", "GET", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",
             "X-API-Key",
             "X-Org-Id",
+            "X-User-Id",
             "X-User-Role",
+            "X-Deal-Id",
             "Content-Type",
         ],
         max_age=600,
@@ -200,6 +272,7 @@ def healthz():
         "key_configured": settings.key_configured,
         "auth_required": settings.auth_required,
         "ai_enabled": settings.ai_enabled,
+        "database": db_status(),
         "org_allowlist": sorted(settings.org_allowlist),
         "org_blocklist": sorted(settings.org_blocklist),
         "allowed_roles": sorted(settings.allowed_roles),
@@ -214,10 +287,15 @@ def healthz():
 )
 def sales_message(
     req: SalesMessageRequest,
+    request: Request,
     client: OpenAI = Depends(get_client),
 ):
-    """Integration endpoint: requires the API key when AI_API_TOKEN is set."""
-    return _generate(req, client)
+    """Integration endpoint: requires the API key when AI_API_TOKEN is set.
+
+    Optional headers X-Org-Id, X-User-Id and X-Deal-Id tie the saved draft
+    and usage record to the Trade Builder's org, user and deal.
+    """
+    return _generate(req, client, request, "ai/sales-message")
 
 
 # ---------------------------------------------------------------------- #
@@ -243,7 +321,9 @@ def _allow(bucket: deque[float], limit: int, now: float) -> bool:
     return len(bucket) < limit
 
 
-def require_same_origin_and_rate_limit(request: Request) -> None:
+def require_same_origin(request: Request) -> None:
+    # Key-free page routes: there is no login, so no user ID is recorded.
+    request.state.demo_page = True
     if not settings.ui_enabled:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Not found.")
     origin = request.headers.get("origin", "")
@@ -256,6 +336,10 @@ def require_same_origin_and_rate_limit(request: Request) -> None:
             status.HTTP_403_FORBIDDEN,
             detail="This endpoint is for the built-in web page. Integrations should use /v1/ai/sales-message with an API key.",
         )
+
+
+def require_same_origin_and_rate_limit(request: Request) -> None:
+    require_same_origin(request)
     now = time.monotonic()
     ip = _client_ip(request)
     with _ui_lock:
@@ -280,9 +364,10 @@ def require_same_origin_and_rate_limit(request: Request) -> None:
 )
 def ui_sales_message(
     req: SalesMessageRequest,
+    request: Request,
     client: OpenAI = Depends(get_client),
 ):
-    return _generate(req, client)
+    return _generate(req, client, request, "ui/sales-message")
 
 
 @app.post(
@@ -291,8 +376,8 @@ def ui_sales_message(
     dependencies=[Depends(require_same_origin_and_rate_limit), Depends(require_ai_access)],
     tags=["ui"],
 )
-def ui_sms_summary(req: SmsSummaryRequest, client: OpenAI = Depends(get_client)):
-    return _sms_summary(req, client)
+def ui_sms_summary(req: SmsSummaryRequest, request: Request, client: OpenAI = Depends(get_client)):
+    return _sms_summary(req, client, request, "ui/sms-summary")
 
 
 @app.post(
@@ -301,12 +386,22 @@ def ui_sms_summary(req: SmsSummaryRequest, client: OpenAI = Depends(get_client))
     dependencies=[Depends(require_token), Depends(require_ai_access)],
     tags=["ai"],
 )
-def sms_summary(req: SmsSummaryRequest, client: OpenAI = Depends(get_client)):
+def sms_summary(req: SmsSummaryRequest, request: Request, client: OpenAI = Depends(get_client)):
     """Integration endpoint: requires the API key when AI_API_TOKEN is set."""
-    return _sms_summary(req, client)
+    return _sms_summary(req, client, request, "ai/sms-summary")
 
 
-def _sms_summary(req: SmsSummaryRequest, client: OpenAI) -> SmsSummaryResponse:
+def _sms_summary(req: SmsSummaryRequest, client: OpenAI, request: Request, endpoint: str) -> SmsSummaryResponse:
+    result = _tracked(request, endpoint, lambda: _sms_summary_call(req, client))
+    storage.record_draft(
+        org_id=_storage_org_id(request), client_id=req.client_id, user_id=_user_id_from_request(request),
+        deal_id=_deal_id_from_request(request), kind="sms_summary", message=result.message,
+        request=req.model_dump(mode="json"), model=settings.model,
+    )
+    return result
+
+
+def _sms_summary_call(req: SmsSummaryRequest, client: OpenAI) -> SmsSummaryResponse:
     link_suffix = f" Deal: {req.deal_link}"
     if len(link_suffix) > 200:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The deal link is too long for a 200-character SMS.")
@@ -342,8 +437,8 @@ def _sms_summary(req: SmsSummaryRequest, client: OpenAI) -> SmsSummaryResponse:
     dependencies=[Depends(require_same_origin_and_rate_limit), Depends(require_ai_access)],
     tags=["ui"],
 )
-def ui_rank_sales_message(req: RankMessageRequest, client: OpenAI = Depends(get_client)):
-    return _rank_message(req, client)
+def ui_rank_sales_message(req: RankMessageRequest, request: Request, client: OpenAI = Depends(get_client)):
+    return _rank_message(req, client, request, "ui/rank-sales-message")
 
 
 @app.post(
@@ -352,16 +447,34 @@ def ui_rank_sales_message(req: RankMessageRequest, client: OpenAI = Depends(get_
     dependencies=[Depends(require_token), Depends(require_ai_access)],
     tags=["ai"],
 )
-def rank_sales_message(req: RankMessageRequest, client: OpenAI = Depends(get_client)):
-    """Integration endpoint: requires the API key when AI_API_TOKEN is set."""
-    return _rank_message(req, client)
+def rank_sales_message(req: RankMessageRequest, request: Request, client: OpenAI = Depends(get_client)):
+    """Integration endpoint: requires the API key when AI_API_TOKEN is set.
+
+    With no indicators in the body, the org's saved rubric (X-Org-Id) is used,
+    then the default rubric.
+    """
+    return _rank_message(req, client, request, "ai/rank-sales-message")
 
 
-def _rank_message(req: RankMessageRequest, client: OpenAI) -> RankMessageResponse:
+def _rank_message(req: RankMessageRequest, client: OpenAI, request: Request, endpoint: str) -> RankMessageResponse:
     if not req.indicators:
-        req = req.model_copy(
-            update={"indicators": [RankingIndicator(**item) for item in DEFAULT_RANKING_INDICATORS]}
-        )
+        saved = storage.try_get_indicators(_storage_org_id(request))
+        try:
+            indicators = [RankingIndicator(**item) for item in (saved or DEFAULT_RANKING_INDICATORS)]
+        except Exception:  # noqa: BLE001 - a malformed saved rubric falls back to the default
+            indicators = [RankingIndicator(**item) for item in DEFAULT_RANKING_INDICATORS]
+        req = req.model_copy(update={"indicators": indicators})
+    result = _tracked(request, endpoint, lambda: _rank_call(req, client))
+    storage.record_ranking(
+        org_id=_storage_org_id(request), draft_id=req.draft_id, client_id=req.client_id,
+        message=req.message, indicators=[i.model_dump() for i in req.indicators],
+        results=[r.model_dump() for r in result.indicators], overall_score=result.overall_score,
+        band=result.band, model=settings.model,
+    )
+    return result
+
+
+def _rank_call(req: RankMessageRequest, client: OpenAI) -> RankMessageResponse:
     if len({indicator.id for indicator in req.indicators}) != len(req.indicators):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Indicator IDs must be unique.")
     rubric = [{"id": item.id, "name": item.name, "guidance": item.guidance} for item in req.indicators]
@@ -412,7 +525,49 @@ def _rank_message(req: RankMessageRequest, client: OpenAI) -> RankMessageRespons
         raise provider_http_error(exc) from exc
 
 
-def _generate(req: SalesMessageRequest, client: OpenAI) -> SalesMessageResponse:
+T = TypeVar("T")
+
+
+def _tracked(request: Request, endpoint: str, call: Callable[[], T]) -> T:
+    """Run an AI call and write one usage-log row, whatever the outcome."""
+    started = time.perf_counter()
+    code, error = 200, None
+    try:
+        return call()
+    except HTTPException as exc:
+        code, error = exc.status_code, str(exc.detail)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        code, error = 500, type(exc).__name__
+        raise
+    finally:
+        storage.record_usage(
+            org_id=_storage_org_id(request), user_id=_user_id_from_request(request),
+            endpoint=endpoint, model=settings.model, status_code=code,
+            latency_ms=int((time.perf_counter() - started) * 1000), error=error,
+        )
+
+
+def _generate(req: SalesMessageRequest, client: OpenAI, request: Request, endpoint: str) -> SalesMessageResponse:
+    org_id = _storage_org_id(request)
+    today = datetime.now(timezone.utc).date()
+    # Advisor turned commentary on but the caller sent none: use the org's saved entry for today.
+    if req.use_market_commentary and not (req.market_commentary or "").strip():
+        saved = storage.try_get_commentary_text(org_id, today)
+        if saved:
+            req = req.model_copy(update={"market_commentary": saved, "market_commentary_date": today})
+    result = _tracked(request, endpoint, lambda: _generate_call(req, client))
+    draft_id = storage.record_draft(
+        org_id=org_id, client_id=req.client_id, user_id=_user_id_from_request(request),
+        deal_id=_deal_id_from_request(request), kind="sales_message", product=req.product,
+        advisor_note=req.advisor_note, message=result.message, subject=result.subject,
+        alternative_message=result.alternative_message, request=req.model_dump(mode="json"),
+        model=result.model,
+    )
+    return result.model_copy(update={"draft_id": draft_id})
+
+
+def _generate_call(req: SalesMessageRequest, client: OpenAI) -> SalesMessageResponse:
     try:
         result = ai.generate_sales_message(
             client, req, model=settings.model, temperature=settings.temperature
@@ -429,6 +584,240 @@ def _generate(req: SalesMessageRequest, client: OpenAI) -> SalesMessageResponse:
         model=settings.model,
         generated_at=ai.now_iso(),
     )
+
+
+# ---------------------------------------------------------------------- #
+# Bot data: organizations, clients, commentary, ranking settings,        #
+# draft history. Stored only in the bot's own database.                  #
+# ---------------------------------------------------------------------- #
+class OrgIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    sector: str | None = Field(default=None, max_length=200)
+
+
+class OrgPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    sector: str | None = Field(default=None, max_length=200)
+
+
+class ClientIn(BaseModel):
+    full_name: str | None = Field(default=None, max_length=200)
+    company: str | None = Field(default=None, max_length=300)
+    email: str | None = Field(default=None, max_length=320)
+    phone: str | None = Field(default=None, max_length=50)
+    type: str | None = Field(default=None, max_length=40)
+    industry: str | None = Field(default=None, max_length=200)
+    risk_appetite: str | None = Field(default=None, max_length=120)
+    hedging_horizon: str | None = Field(default=None, max_length=120)
+    functional_currency: str | None = Field(default=None, max_length=12)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class ClientImportIn(BaseModel):
+    clients: list[ClientIn] = Field(..., min_length=1, max_length=200)
+
+
+class CommentaryIn(BaseModel):
+    model_config = {"populate_by_name": True}
+    # JSON field "date" (YYYY-MM-DD); defaults to today (UTC).
+    commentary_date: date | None = Field(default=None, alias="date")
+    text: str = Field(..., min_length=1, max_length=8000)
+
+
+class IndicatorsIn(BaseModel):
+    indicators: list[RankingIndicator] = Field(..., min_length=1, max_length=20)
+
+
+def require_db() -> None:
+    if not storage.enabled():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is not configured. Set DATABASE_URL in the .env file, then restart the service.",
+        )
+
+
+def _db_call(fn: Callable[[], T]) -> T:
+    try:
+        return fn()
+    except (HTTPException, ValueError):  # ValueError = input validation, not an outage
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Database request failed: %s", type(exc).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="The database is unavailable. Try again shortly.") from exc
+
+
+def require_org(request: Request) -> uuid.UUID:
+    raw = _org_id_from_request(request)
+    if not raw:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Supply X-Org-Id.")
+    org_id = storage.parse_uuid(raw)
+    if org_id is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="X-Org-Id must be an organization id (UUID).")
+    if not _db_call(lambda: storage.org_exists(org_id)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unknown organization.")
+    return org_id
+
+
+def _clean(model: BaseModel) -> dict:
+    """Fields the caller sent, trimmed; blank strings become null."""
+    out = {}
+    for key, value in model.model_dump(exclude_unset=True).items():
+        if isinstance(value, str):
+            value = value.strip() or None
+        out[key] = value
+    return out
+
+
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def build_data_router(read_deps: list, write_deps: list, *, reports: bool) -> APIRouter:
+    r = APIRouter()
+
+    # ---- organizations ----
+    @r.get("/orgs", dependencies=read_deps)
+    def list_orgs():
+        return {"orgs": _db_call(storage.list_orgs)}
+
+    @r.post("/orgs", dependencies=write_deps, status_code=status.HTTP_201_CREATED)
+    def create_org(body: OrgIn):
+        fields = _clean(body)
+        if not fields.get("name"):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Organization name is required.")
+        return _db_call(lambda: storage.create_org(fields["name"], fields.get("sector")))
+
+    @r.patch("/orgs/{org_id}", dependencies=write_deps)
+    def update_org(org_id: uuid.UUID, body: OrgPatch):
+        fields = _clean(body)
+        if "name" in fields and not fields["name"]:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Organization name can't be blank.")
+        found = _db_call(lambda: storage.update_org(org_id, fields))
+        if not found:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unknown organization.")
+        return found
+
+    # ---- clients (scoped by X-Org-Id) ----
+    @r.get("/clients", dependencies=read_deps)
+    def list_clients(request: Request, include_inactive: bool = False):
+        org_id = require_org(request)
+        return {"clients": _db_call(lambda: storage.list_clients(org_id, include_inactive))}
+
+    @r.post("/clients", dependencies=write_deps, status_code=status.HTTP_201_CREATED)
+    def create_client(body: ClientIn, request: Request):
+        org_id = require_org(request)
+        fields = _clean(body)
+        if not (fields.get("full_name") or fields.get("company")):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Add a contact name or company.")
+        return _db_call(lambda: storage.create_client(org_id, fields, _user_id_from_request(request)))
+
+    @r.post("/clients/import", dependencies=write_deps)
+    def import_clients(body: ClientImportIn, request: Request):
+        """One-time upload of a browser's saved clients into an org that has none.
+
+        Atomic: if the org already has clients (e.g. another tab got there first),
+        nothing is imported and the existing clients are returned.
+        """
+        org_id = require_org(request)
+        rows = [f for f in (_clean(c) for c in body.clients) if f.get("full_name") or f.get("company")]
+        return _db_call(lambda: storage.import_clients(org_id, rows, _user_id_from_request(request)))
+
+    @r.put("/clients/{client_id}", dependencies=write_deps)
+    def update_client(client_id: uuid.UUID, body: ClientIn, request: Request):
+        org_id = require_org(request)
+        fields = _clean(body)
+        try:
+            found = _db_call(lambda: storage.update_client(org_id, client_id, fields))
+        except ValueError as exc:  # validation failed; nothing was saved
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        if not found:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unknown client.")
+        return found
+
+    @r.delete("/clients/{client_id}", dependencies=write_deps, status_code=status.HTTP_204_NO_CONTENT)
+    def delete_client(client_id: uuid.UUID, request: Request):
+        """Deletes the client and every draft and ranking filed under them."""
+        org_id = require_org(request)
+        if not _db_call(lambda: storage.delete_client(org_id, client_id)):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unknown client.")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    # ---- market commentary ----
+    @r.get("/org/market-commentary", dependencies=read_deps)
+    def get_market_commentary(request: Request, day: date | None = Query(default=None, alias="date")):
+        """The org's market commentary for a date (default today, UTC)."""
+        org_id = require_org(request)
+        day = day or _today()
+        found = _db_call(lambda: storage.get_commentary(org_id, day))
+        if not found:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"No market commentary saved for {day.isoformat()}.")
+        return found
+
+    @r.put("/org/market-commentary", dependencies=write_deps)
+    def put_market_commentary(body: CommentaryIn, request: Request):
+        org_id = require_org(request)
+        day = body.commentary_date or _today()
+        return _db_call(lambda: storage.put_commentary(org_id, day, body.text.strip(), _user_id_from_request(request)))
+
+    # ---- ranking indicators ----
+    @r.get("/org/ranking-indicators", dependencies=read_deps)
+    def get_ranking_indicators(request: Request):
+        """The org's ranking rubric, or the default rubric if none is saved."""
+        org_id = require_org(request)
+        found = _db_call(lambda: storage.get_indicators(org_id))
+        if found:
+            return {**found, "source": "organization"}
+        return {"org_id": str(org_id), "indicators": DEFAULT_RANKING_INDICATORS, "updated_by": None,
+                "updated_at": None, "source": "default"}
+
+    @r.put("/org/ranking-indicators", dependencies=write_deps)
+    def put_ranking_indicators(body: IndicatorsIn, request: Request):
+        org_id = require_org(request)
+        if len({i.id for i in body.indicators}) != len(body.indicators):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Indicator IDs must be unique.")
+        rows = [i.model_dump() for i in body.indicators]
+        return {**_db_call(lambda: storage.put_indicators(org_id, rows, _user_id_from_request(request))),
+                "source": "organization"}
+
+    # ---- draft history ----
+    @r.get("/drafts", dependencies=read_deps)
+    def get_drafts(
+        request: Request,
+        deal_id: str | None = Query(default=None, max_length=128),
+        user_id: str | None = Query(default=None, max_length=128),
+        client_id: uuid.UUID | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+    ):
+        """Draft history for the org, newest first, each with its latest ranking."""
+        org_id = require_org(request)
+        return {"drafts": _db_call(lambda: storage.list_drafts(
+            org_id, deal_id=deal_id, user_id=user_id, client_id=client_id, limit=limit))}
+
+    @r.delete("/drafts/{draft_id}", dependencies=write_deps, status_code=status.HTTP_204_NO_CONTENT)
+    def delete_draft(draft_id: int, request: Request):
+        """Deletes one saved draft (and its rankings) from the org's history."""
+        org_id = require_org(request)
+        if not _db_call(lambda: storage.delete_draft(org_id, draft_id)):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unknown draft.")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    if reports:
+        @r.get("/rankings/summary", dependencies=read_deps)
+        def get_ranking_summary(request: Request, days: int = Query(default=30, ge=1, le=365)):
+            """Average score and green/amber/red counts over the last `days` days."""
+            org_id = require_org(request)
+            return _db_call(lambda: storage.ranking_summary(org_id, days))
+
+    return r
+
+
+_KEYED = [Depends(require_token), Depends(require_db)]
+_PAGE_READ = [Depends(require_same_origin), Depends(require_db)]
+_PAGE_WRITE = [Depends(require_same_origin_and_rate_limit), Depends(require_db)]
+
+# Integrations (API key) and the built-in page (same-origin, no login).
+app.include_router(build_data_router(_KEYED, _KEYED, reports=True), prefix="/v1", tags=["bot data"])
+app.include_router(build_data_router(_PAGE_READ, _PAGE_WRITE, reports=False), prefix="/v1/ui", tags=["ui"])
 
 
 if DEMO_DIR.is_dir():

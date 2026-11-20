@@ -48,6 +48,25 @@ message lands in the editable Intro message box; every draft stays in the strip
 above it (replace-with-history). The **Send Email** button is **MOCKED** and does
 not email anything.
 
+## Database (optional, Neon Postgres)
+
+The bot keeps its own records in its own Neon database, `AISalesMessage_bot`,
+inside the Trade Builder's Neon project. Those records are organizations, client
+profiles, daily market commentary, the ranking rubric, draft history, ranking
+results and a usage log. Table and column names follow the Trade Builder's, but
+the bot never reads or writes the Trade Builder database.
+
+1. In Neon, open the `AISalesMessage_bot` database → **Connect** and copy the **pooled** connection string (host contains `-pooler`).
+2. Set `DATABASE_URL=` to it in `.env` (and in the Railway/Render environment). Never commit it.
+3. Restart. Missing tables are created on startup, and `GET /healthz` shows `"database": "ok"`.
+
+Drafts and rankings are deleted after `DRAFT_RETENTION_DAYS` (default 90).
+Deleting a client deletes their drafts too. With `DATABASE_URL` empty,
+everything works as before from browser storage. Tests always use a temporary
+SQLite file, never the real database. Schema changes to an existing database go
+in [backend/migrations/](backend/migrations/). See
+[API.md](API.md#stored-data-bot-database) for the endpoints.
+
 ## Feature gating and org-level rollout
 
 The service supports a simple rollout model for the AI feature itself:
